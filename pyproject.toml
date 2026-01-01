@@ -18,6 +18,9 @@ dependencies = [
 dev = [
   "pytest>=7.0",
 ]
+plot = [
+  "matplotlib>=3.7",
+]
 
 [project.scripts]
 all-weather-backtest = "all_weather_backtest:main"

@@ -8,7 +8,7 @@ Data sources:
 
 Notes:
 - This is an ETF proxy of the ideas in the Bridgewater document.
-- Leverage costs, taxes, and trading slippage are not modeled.
+- Trading and financing costs can be included; taxes and slippage are not modeled.
 """
 
 from __future__ import annotations
@@ -99,6 +99,29 @@ def parse_args() -> argparse.Namespace:
         "--out",
         default=None,
         help="Output directory for CSVs (optional)",
+    )
+    parser.add_argument(
+        "--trade-cost",
+        type=float,
+        default=0.0,
+        help="Trading cost per $ turnover (e.g. 0.0005 = 5 bps)",
+    )
+    parser.add_argument(
+        "--borrow-rate",
+        type=float,
+        default=0.0,
+        help="Annualized borrow rate on leverage (e.g. 0.03 for 3%%)",
+    )
+    parser.add_argument(
+        "--cash-rate",
+        type=float,
+        default=0.0,
+        help="Annualized interest on idle cash (e.g. 0.02 for 2%%)",
+    )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="Save equity + drawdown plot (uses --out or cwd)",
     )
     return parser.parse_args()
 
@@ -307,9 +330,49 @@ def compute_portfolio(
 
         weights_hist.loc[date] = weights
 
-    weights_daily = weights_hist.reindex(returns.index).ffill().dropna()
+    weights_daily = weights_hist.reindex(returns.index).ffill()
+    weights_daily = weights_daily.shift(1).dropna()
     port_returns = (returns.loc[weights_daily.index] * weights_daily).sum(axis=1)
     return port_returns, weights_daily
+
+
+def compute_equity_drawdown(returns: pd.Series) -> Tuple[pd.Series, pd.Series]:
+    equity = (1 + returns).cumprod()
+    drawdown = equity / equity.cummax() - 1.0
+    return equity, drawdown
+
+
+def apply_costs(
+    returns: pd.Series,
+    weights: pd.DataFrame,
+    trade_cost: float,
+    borrow_rate: float,
+    cash_rate: float,
+    ann_factor: int,
+) -> Tuple[pd.Series, pd.DataFrame]:
+    if trade_cost < 0 or borrow_rate < 0 or cash_rate < 0:
+        raise ValueError("Costs and rates must be non-negative.")
+    weights = weights.reindex(returns.index)
+    gross_leverage = weights.abs().sum(axis=1)
+    turnover = weights.diff().abs().sum(axis=1)
+    if not turnover.empty:
+        # Assume initial allocation from cash.
+        turnover.iloc[0] = weights.iloc[0].abs().sum()
+    trading_cost = turnover * trade_cost
+    borrow_cost = (gross_leverage - 1.0).clip(lower=0.0) * (borrow_rate / ann_factor)
+    cash_yield = (1.0 - gross_leverage).clip(lower=0.0) * (cash_rate / ann_factor)
+    net_returns = returns - trading_cost - borrow_cost + cash_yield
+    costs = pd.DataFrame(
+        {
+            "turnover": turnover,
+            "trading_cost": trading_cost,
+            "borrow_cost": borrow_cost,
+            "cash_yield": cash_yield,
+            "financing_impact": cash_yield - borrow_cost,
+        },
+        index=returns.index,
+    )
+    return net_returns, costs
 
 
 def performance_stats(returns: pd.Series, ann_factor: int) -> Dict[str, float]:
@@ -322,8 +385,7 @@ def performance_stats(returns: pd.Series, ann_factor: int) -> Dict[str, float]:
     ann_vol = returns.std() * np.sqrt(ann_factor)
     sharpe = ann_return / ann_vol if ann_vol > 0 else np.nan
 
-    equity = (1 + returns).cumprod()
-    drawdown = equity / equity.cummax() - 1.0
+    _, drawdown = compute_equity_drawdown(returns)
     max_dd = drawdown.min()
 
     return {
@@ -335,8 +397,41 @@ def performance_stats(returns: pd.Series, ann_factor: int) -> Dict[str, float]:
     }
 
 
+def plot_performance(returns: pd.Series, out_path: Path, title: str) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError(
+            "matplotlib is required for --plot. Install with "
+            "`pip install matplotlib` or `pip install -e '.[plot]'`."
+        ) from exc
+
+    equity, drawdown = compute_equity_drawdown(returns)
+    fig, (ax_eq, ax_dd) = plt.subplots(
+        2,
+        1,
+        figsize=(10, 6),
+        sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]},
+    )
+    ax_eq.plot(equity.index, equity.values, color="#1f77b4")
+    ax_eq.set_title(title)
+    ax_eq.set_ylabel("Equity")
+    ax_eq.grid(True, alpha=0.3)
+
+    ax_dd.fill_between(drawdown.index, drawdown.values, 0, color="#d62728", alpha=0.3)
+    ax_dd.set_ylabel("Drawdown")
+    ax_dd.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
 def main() -> None:
     args = parse_args()
+    if args.trade_cost < 0 or args.borrow_rate < 0 or args.cash_rate < 0:
+        raise ValueError("Cost parameters must be non-negative.")
 
     tickers = _parse_tickers(args.tickers)
     start = _parse_date(args.start)
@@ -360,7 +455,7 @@ def main() -> None:
     else:
         prices = fetch_alpaca_prices(tickers, start, end, args.alpaca_feed)
 
-    port_returns, weights_daily = compute_portfolio(
+    gross_returns, weights_daily = compute_portfolio(
         prices=prices,
         lookback=args.lookback,
         rebalance=args.rebalance,
@@ -371,46 +466,94 @@ def main() -> None:
         ann_factor=args.ann_factor,
     )
 
-    stats = performance_stats(port_returns, args.ann_factor)
-    gross_leverage = weights_daily.sum(axis=1)
+    net_returns = gross_returns
+    costs = None
+    if args.trade_cost > 0 or args.borrow_rate > 0 or args.cash_rate > 0:
+        net_returns, costs = apply_costs(
+            gross_returns,
+            weights_daily,
+            trade_cost=args.trade_cost,
+            borrow_rate=args.borrow_rate,
+            cash_rate=args.cash_rate,
+            ann_factor=args.ann_factor,
+        )
+
+    gross_stats = performance_stats(gross_returns, args.ann_factor)
+    net_stats = performance_stats(net_returns, args.ann_factor)
+    gross_leverage = weights_daily.abs().sum(axis=1)
 
     print("Backtest Summary")
     print("---------------")
     print(f"Data source     : {args.data_source}")
     print(f"Tickers         : {', '.join(tickers)}")
-    print(f"Period          : {port_returns.index[0].date()} -> {port_returns.index[-1].date()}")
+    print(f"Period          : {net_returns.index[0].date()} -> {net_returns.index[-1].date()}")
     print(f"Rebalance       : {args.rebalance}")
     print(f"Portfolio       : {args.portfolio}")
     print(f"Target vol      : {args.target_vol:.2%}")
     print(f"Max leverage    : {args.max_leverage:.2f}x")
+    print(f"Trade cost      : {args.trade_cost * 1e4:.1f} bps")
+    print(f"Borrow rate     : {args.borrow_rate:.2%}")
+    print(f"Cash rate       : {args.cash_rate:.2%}")
     print("")
-    print("Performance")
-    print(f"Total Return    : {stats['total_return']:.2%}")
-    print(f"CAGR            : {stats['ann_return']:.2%}")
-    print(f"Ann. Vol        : {stats['ann_vol']:.2%}")
-    print(f"Sharpe (rf=0)   : {stats['sharpe']:.2f}")
-    print(f"Max Drawdown    : {stats['max_drawdown']:.2%}")
     print(f"Avg Gross Lev   : {gross_leverage.mean():.2f}x")
     print(f"Max Gross Lev   : {gross_leverage.max():.2f}x")
+    if costs is not None:
+        print(f"Avg Turnover    : {costs['turnover'].mean():.2f}x")
+        print(f"Max Turnover    : {costs['turnover'].max():.2f}x")
+    print("")
+    if costs is not None:
+        print("Performance (net)")
+    else:
+        print("Performance")
+    print(f"Total Return    : {net_stats['total_return']:.2%}")
+    print(f"CAGR            : {net_stats['ann_return']:.2%}")
+    print(f"Ann. Vol        : {net_stats['ann_vol']:.2%}")
+    print(f"Sharpe (rf=0)   : {net_stats['sharpe']:.2f}")
+    print(f"Max Drawdown    : {net_stats['max_drawdown']:.2%}")
+    if costs is not None:
+        print("")
+        print("Performance (gross)")
+        print(f"Total Return    : {gross_stats['total_return']:.2%}")
+        print(f"CAGR            : {gross_stats['ann_return']:.2%}")
+        print(f"Ann. Vol        : {gross_stats['ann_vol']:.2%}")
+        print(f"Sharpe (rf=0)   : {gross_stats['sharpe']:.2f}")
+        print(f"Max Drawdown    : {gross_stats['max_drawdown']:.2%}")
 
     if args.out:
         out_dir = Path(args.out)
         out_dir.mkdir(parents=True, exist_ok=True)
-        port_returns.to_csv(out_dir / "portfolio_returns.csv", header=["return"])
+        net_returns.to_csv(out_dir / "portfolio_returns.csv", header=["return"])
         weights_daily.to_csv(out_dir / "weights_daily.csv")
-        (1 + port_returns).cumprod().to_csv(out_dir / "equity_curve.csv", header=["equity"])
+        (1 + net_returns).cumprod().to_csv(out_dir / "equity_curve.csv", header=["equity"])
+        if costs is not None:
+            gross_returns.to_csv(out_dir / "portfolio_returns_gross.csv", header=["return"])
+            (1 + gross_returns).cumprod().to_csv(
+                out_dir / "equity_curve_gross.csv",
+                header=["equity"],
+            )
+            costs.to_csv(out_dir / "costs_daily.csv")
         meta = {
             "data_source": args.data_source,
             "tickers": tickers,
-            "period_start": str(port_returns.index[0].date()),
-            "period_end": str(port_returns.index[-1].date()),
+            "period_start": str(net_returns.index[0].date()),
+            "period_end": str(net_returns.index[-1].date()),
             "rebalance": args.rebalance,
             "portfolio": args.portfolio,
             "lookback": args.lookback,
             "target_vol": args.target_vol,
             "max_leverage": args.max_leverage,
+            "trade_cost": args.trade_cost,
+            "borrow_rate": args.borrow_rate,
+            "cash_rate": args.cash_rate,
+            "execution_lag_days": 1,
         }
         (out_dir / "run_meta.json").write_text(json.dumps(meta, indent=2))
+
+    if args.plot:
+        plot_dir = Path(args.out) if args.out else Path.cwd()
+        plot_path = plot_dir / "equity_drawdown.png"
+        plot_performance(net_returns, plot_path, f"All Weather ({args.portfolio})")
+        print(f"Plot saved to   : {plot_path}")
 
 
 if __name__ == "__main__":

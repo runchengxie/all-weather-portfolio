@@ -4,6 +4,7 @@ import pandas as pd
 from all_weather_backtest import (
     _parse_fixed_weights,
     _parse_tickers,
+    apply_costs,
     compute_portfolio,
     inverse_vol_weights,
     performance_stats,
@@ -71,6 +72,68 @@ def test_compute_portfolio_inverse_vol_daily_rebalance() -> None:
     assert port_returns.index.equals(weights.index)
     assert set(weights.columns) == {"AAA", "BBB"}
     assert np.allclose(weights.sum(axis=1).values, 1.0)
+
+
+def test_compute_portfolio_applies_one_day_lag() -> None:
+    dates = pd.date_range("2020-01-01", periods=6, freq="D")
+    prices = pd.DataFrame({"AAA": [100, 101, 102, 103, 104, 105]}, index=dates)
+    fixed_weights = pd.Series({"AAA": 1.0})
+
+    port_returns, weights = compute_portfolio(
+        prices=prices,
+        lookback=2,
+        rebalance="D",
+        portfolio="fixed",
+        fixed_weights=fixed_weights,
+        target_vol=0.0,
+        max_leverage=2.0,
+        ann_factor=252,
+    )
+
+    assert port_returns.index[0] == dates[3]
+    assert weights.index[0] == dates[3]
+
+
+def test_apply_costs_trading_and_cash() -> None:
+    dates = pd.date_range("2020-01-01", periods=3, freq="D")
+    returns = pd.Series([0.01, 0.01, 0.01], index=dates)
+    weights = pd.DataFrame({"AAA": [1.0, 1.0, 0.5]}, index=dates)
+
+    net_returns, costs = apply_costs(
+        returns,
+        weights,
+        trade_cost=0.001,
+        borrow_rate=0.1,
+        cash_rate=0.05,
+        ann_factor=10,
+    )
+
+    expected_turnover = pd.Series([1.0, 0.0, 0.5], index=dates)
+    expected_trading_cost = expected_turnover * 0.001
+    expected_cash_yield = pd.Series([0.0, 0.0, 0.5 * 0.05 / 10], index=dates)
+    expected_net = returns - expected_trading_cost + expected_cash_yield
+
+    assert np.allclose(costs["turnover"].values, expected_turnover.values)
+    assert np.allclose(net_returns.values, expected_net.values)
+
+
+def test_apply_costs_borrow_cost() -> None:
+    dates = pd.date_range("2020-01-01", periods=2, freq="D")
+    returns = pd.Series([0.0, 0.0], index=dates)
+    weights = pd.DataFrame({"AAA": [1.5, 1.5]}, index=dates)
+
+    net_returns, costs = apply_costs(
+        returns,
+        weights,
+        trade_cost=0.0,
+        borrow_rate=0.1,
+        cash_rate=0.0,
+        ann_factor=10,
+    )
+
+    expected_borrow = pd.Series([0.5 * 0.1 / 10, 0.5 * 0.1 / 10], index=dates)
+    assert np.allclose(costs["borrow_cost"].values, expected_borrow.values)
+    assert np.allclose(net_returns.values, (-expected_borrow).values)
 
 
 def test_performance_stats_basic() -> None:
