@@ -9,27 +9,35 @@ Backtest Summary
 ---------------
 Data source     : stooq
 Tickers         : SPY, TLT, IEF, GLD, DBC
+Benchmark       : SPY
 Period          : 2006-06-01 -> 2025-12-31
 Rebalance       : M
 Portfolio       : risk-parity
 Data cache      : data
 Data format     : csv
-Data refresh    : on
-Target vol      : 10.00%
-Max leverage    : 2.00x
+Data refresh    : off
+Target vol      : 0.00%
+Max leverage    : 1.00x
 Trade cost      : 0.0 bps
 Borrow rate     : 0.00%
 Cash rate       : 0.00%
 
-Avg Gross Lev   : 1.14x
-Max Gross Lev   : 2.00x
+Avg Gross Lev   : 1.00x
+Max Gross Lev   : 1.00x
 
 Performance
-Total Return    : 191.51%
-CAGR            : 5.62%
-Ann. Vol        : 11.78%
-Sharpe (rf=0)   : 0.48
-Max Drawdown    : -37.34%
+Total Return    : 229.94%
+CAGR            : 6.30%
+Ann. Vol        : 11.26%
+Sharpe (rf=0)   : 0.56
+Max Drawdown    : -31.09%
+
+Benchmark (SPY)
+Total Return    : 592.81%
+CAGR            : 10.41%
+Ann. Vol        : 19.54%
+Sharpe (rf=0)   : 0.53
+Max Drawdown    : -56.47%
 Plot saved to   : out/equity_drawdown.png
 ```
 
