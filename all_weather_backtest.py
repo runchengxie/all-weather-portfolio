@@ -66,6 +66,11 @@ def parse_args() -> argparse.Namespace:
         default=",".join(DEFAULT_TICKERS),
         help="Comma-separated ETF tickers (e.g. SPY,TLT,IEF,GLD,DBC)",
     )
+    parser.add_argument(
+        "--benchmark",
+        default="SPY",
+        help="Benchmark ticker (set to 'none' to disable)",
+    )
     parser.add_argument("--start", default=None, help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", default=None, help="End date (YYYY-MM-DD)")
     parser.add_argument(
@@ -158,6 +163,15 @@ def _parse_tickers(value: str) -> List[str]:
     if not tickers:
         raise ValueError("No tickers provided.")
     return tickers
+
+
+def _parse_benchmark(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    symbol = value.strip().upper()
+    if symbol in {"", "NONE", "OFF", "NO"}:
+        return None
+    return symbol
 
 
 def _parse_fixed_weights(value: str) -> Dict[str, float]:
@@ -597,7 +611,13 @@ def performance_stats(returns: pd.Series, ann_factor: int) -> Dict[str, float]:
     }
 
 
-def plot_performance(returns: pd.Series, out_path: Path, title: str) -> None:
+def plot_performance(
+    returns: pd.Series,
+    out_path: Path,
+    title: str,
+    benchmark_returns: Optional[pd.Series] = None,
+    benchmark_label: Optional[str] = None,
+) -> None:
     try:
         import matplotlib.pyplot as plt
     except ImportError as exc:
@@ -607,6 +627,10 @@ def plot_performance(returns: pd.Series, out_path: Path, title: str) -> None:
         ) from exc
 
     equity, drawdown = compute_equity_drawdown(returns)
+    benchmark_equity = None
+    benchmark_drawdown = None
+    if benchmark_returns is not None and not benchmark_returns.empty:
+        benchmark_equity, benchmark_drawdown = compute_equity_drawdown(benchmark_returns)
     fig, (ax_eq, ax_dd) = plt.subplots(
         2,
         1,
@@ -614,14 +638,35 @@ def plot_performance(returns: pd.Series, out_path: Path, title: str) -> None:
         sharex=True,
         gridspec_kw={"height_ratios": [3, 1]},
     )
-    ax_eq.plot(equity.index, equity.values, color="#1f77b4")
+    ax_eq.plot(equity.index, equity.values, color="#1f77b4", label="Portfolio")
+    if benchmark_equity is not None:
+        label = f"Benchmark ({benchmark_label})" if benchmark_label else "Benchmark"
+        ax_eq.plot(
+            benchmark_equity.index,
+            benchmark_equity.values,
+            color="#ff7f0e",
+            label=label,
+        )
     ax_eq.set_title(title)
     ax_eq.set_ylabel("Equity")
     ax_eq.grid(True, alpha=0.3)
+    ax_eq.legend(loc="upper left")
 
-    ax_dd.fill_between(drawdown.index, drawdown.values, 0, color="#d62728", alpha=0.3)
+    ax_dd.fill_between(drawdown.index, drawdown.values, 0, color="#d62728", alpha=0.3, label="Portfolio")
+    if benchmark_drawdown is not None:
+        label = f"Benchmark ({benchmark_label})" if benchmark_label else "Benchmark"
+        ax_dd.plot(
+            benchmark_drawdown.index,
+            benchmark_drawdown.values,
+            color="#555555",
+            linestyle="--",
+            linewidth=1.2,
+            label=label,
+        )
     ax_dd.set_ylabel("Drawdown")
     ax_dd.grid(True, alpha=0.3)
+    if benchmark_drawdown is not None:
+        ax_dd.legend(loc="lower left")
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -634,6 +679,7 @@ def main() -> None:
         raise ValueError("Cost parameters must be non-negative.")
 
     tickers = _parse_tickers(args.tickers)
+    benchmark = _parse_benchmark(args.benchmark)
     start = _parse_date(args.start)
     end = _parse_date(args.end)
     data_dir = Path(args.data_dir).expanduser() if args.data_dir else None
@@ -694,14 +740,47 @@ def main() -> None:
             ann_factor=args.ann_factor,
         )
 
+    benchmark_returns = None
+    benchmark_stats = None
+    if benchmark:
+        if benchmark in prices.columns:
+            benchmark_prices = prices[benchmark].dropna()
+        elif args.data_source == "stooq":
+            benchmark_prices = fetch_stooq_prices(
+                [benchmark],
+                start,
+                end,
+                data_dir=data_dir,
+                data_format=args.data_format,
+                refresh_data=args.refresh_data,
+            )[benchmark]
+        else:
+            benchmark_prices = fetch_alpaca_prices(
+                [benchmark],
+                start,
+                end,
+                args.alpaca_feed,
+                data_dir=data_dir,
+                data_format=args.data_format,
+                refresh_data=args.refresh_data,
+            )[benchmark]
+        benchmark_returns = benchmark_prices.pct_change().dropna()
+        benchmark_returns = benchmark_returns.reindex(net_returns.index).dropna()
+        if benchmark_returns.empty:
+            raise ValueError(f"No benchmark data for {benchmark} in backtest period.")
+
     gross_stats = performance_stats(gross_returns, args.ann_factor)
     net_stats = performance_stats(net_returns, args.ann_factor)
+    if benchmark_returns is not None:
+        benchmark_stats = performance_stats(benchmark_returns, args.ann_factor)
     gross_leverage = weights_daily.abs().sum(axis=1)
 
     print("Backtest Summary")
     print("---------------")
     print(f"Data source     : {args.data_source}")
     print(f"Tickers         : {', '.join(tickers)}")
+    if benchmark:
+        print(f"Benchmark       : {benchmark}")
     print(f"Period          : {net_returns.index[0].date()} -> {net_returns.index[-1].date()}")
     print(f"Rebalance       : {args.rebalance}")
     print(f"Portfolio       : {args.portfolio}")
@@ -738,6 +817,14 @@ def main() -> None:
         print(f"Ann. Vol        : {gross_stats['ann_vol']:.2%}")
         print(f"Sharpe (rf=0)   : {gross_stats['sharpe']:.2f}")
         print(f"Max Drawdown    : {gross_stats['max_drawdown']:.2%}")
+    if benchmark_stats is not None:
+        print("")
+        print(f"Benchmark ({benchmark})")
+        print(f"Total Return    : {benchmark_stats['total_return']:.2%}")
+        print(f"CAGR            : {benchmark_stats['ann_return']:.2%}")
+        print(f"Ann. Vol        : {benchmark_stats['ann_vol']:.2%}")
+        print(f"Sharpe (rf=0)   : {benchmark_stats['sharpe']:.2f}")
+        print(f"Max Drawdown    : {benchmark_stats['max_drawdown']:.2%}")
 
     if args.out:
         out_dir = Path(args.out)
@@ -745,6 +832,12 @@ def main() -> None:
         net_returns.to_csv(out_dir / "portfolio_returns.csv", header=["return"])
         weights_daily.to_csv(out_dir / "weights_daily.csv")
         (1 + net_returns).cumprod().to_csv(out_dir / "equity_curve.csv", header=["equity"])
+        if benchmark_returns is not None:
+            benchmark_returns.to_csv(out_dir / "benchmark_returns.csv", header=["return"])
+            (1 + benchmark_returns).cumprod().to_csv(
+                out_dir / "benchmark_equity_curve.csv",
+                header=["equity"],
+            )
         if costs is not None:
             gross_returns.to_csv(out_dir / "portfolio_returns_gross.csv", header=["return"])
             (1 + gross_returns).cumprod().to_csv(
@@ -760,6 +853,7 @@ def main() -> None:
             "rebalance": args.rebalance,
             "portfolio": args.portfolio,
             "lookback": args.lookback,
+            "benchmark": benchmark,
             "target_vol": args.target_vol,
             "max_leverage": args.max_leverage,
             "data_dir": str(data_dir) if data_dir else None,
@@ -775,7 +869,13 @@ def main() -> None:
     if args.plot:
         plot_dir = Path(args.out) if args.out else Path.cwd()
         plot_path = plot_dir / "equity_drawdown.png"
-        plot_performance(net_returns, plot_path, f"All Weather ({args.portfolio})")
+        plot_performance(
+            net_returns,
+            plot_path,
+            f"All Weather ({args.portfolio})",
+            benchmark_returns=benchmark_returns,
+            benchmark_label=benchmark,
+        )
         print(f"Plot saved to   : {plot_path}")
 
 
