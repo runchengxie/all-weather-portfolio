@@ -104,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-leverage",
         type=float,
-        default=2.0,
+        default=1.0,
         help="Max gross leverage (e.g. 2.0 means 2x)",
     )
     parser.add_argument(

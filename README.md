@@ -107,7 +107,7 @@ python all_weather_backtest.py --data-source alpaca --alpaca-feed iex
 * `--lookback`：回看窗口（交易日）
 * `--rebalance`：再平衡频率（pandas offset alias，如 `M`、`W-FRI`）
 * `--target-vol`：目标年化波动率
-* `--max-leverage`：最大总杠杆
+* `--max-leverage`：最大总杠杆（默认 1.0，无杠杆）
 * `--trade-cost`：交易成本（按换手率计费，0.0005 = 5 bps）
 * `--borrow-rate`：借贷年化利率
 * `--cash-rate`：现金年化利率
