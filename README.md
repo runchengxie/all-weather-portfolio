@@ -7,6 +7,7 @@
 - 波动率目标：按滚动窗口估计组合波动，控制目标波动与最大杠杆
 - 交易成本/融资成本：按换手率计费，支持借贷利率与现金利率
 - 数据来源：Stooq（默认，无需 API key）或 Alpaca（需要 API key）
+- 数据缓存：默认存放在 `data/`，支持 CSV 或 Parquet（Parquet 需额外依赖）
 - 可选输出：权重序列、组合收益、净值曲线、成本明细与运行元信息
 - 可选绘图：净值 + 回撤图（需 matplotlib）
 
@@ -14,10 +15,19 @@
 - Python 3.9+
 - 依赖：`numpy`、`pandas`、`requests`
 - 可选：`matplotlib`（用于 `--plot`）
+- 可选：`pyarrow`（或 `fastparquet`，用于 `--data-format parquet`）
 
 ## 安装
 ```bash
 pip install -e .
+```
+
+## 使用 uv
+```bash
+uv sync
+uv sync --extra dev
+uv sync --extra plot
+uv sync --extra data
 ```
 
 ## 快速开始
@@ -35,6 +45,9 @@ python all_weather_backtest.py \
 
 # 启用成本与绘图
 python all_weather_backtest.py --trade-cost 0.0005 --borrow-rate 0.03 --cash-rate 0.02 --plot --out out/
+
+# 使用 Parquet 缓存价格数据
+python all_weather_backtest.py --data-format parquet --out out/
 ```
 
 ## 使用 Alpaca 数据
@@ -47,6 +60,9 @@ python all_weather_backtest.py --data-source alpaca --alpaca-feed iex
 
 ## 关键参数说明
 - `--data-source`：`stooq` 或 `alpaca`
+- `--data-dir`：价格数据缓存目录（默认 `data/`，设为空可禁用）
+- `--data-format`：缓存格式（`csv` 或 `parquet`）
+- `--refresh-data`：强制刷新缓存数据
 - `--tickers`：逗号分隔 ETF 列表，例如 `SPY,TLT,IEF,GLD,DBC`
 - `--portfolio`：`risk-parity`、`inverse-vol`、`fixed`
 - `--fixed-weights`：固定权重字符串（会自动归一化）
@@ -72,10 +88,22 @@ python all_weather_backtest.py --data-source alpaca --alpaca-feed iex
 ## 绘图输出（当使用 `--plot`）
 - `equity_drawdown.png`：净值 + 回撤图（输出到 `--out` 或当前目录）
 
+## 数据缓存
+默认缓存价格数据到 `data/`，便于复用与离线分析。需要更新数据时可使用 `--refresh-data`，或直接删除对应缓存文件。
+
+## README 示例图
+运行回测并生成图表后，把 `out/equity_drawdown.png` 复制到 `docs/assets/equity_drawdown.png`，即可在 README 中展示：
+
+![Equity and drawdown](docs/assets/equity_drawdown.png)
+
 ## 测试
 ```bash
 pip install -e ".[dev]"
 ./scripts/test.sh
+
+# 使用 uv
+uv sync --extra dev
+uv run python -m pytest -q
 ```
 
 ## 备注

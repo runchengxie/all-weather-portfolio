@@ -14,8 +14,10 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -42,6 +44,22 @@ def parse_args() -> argparse.Namespace:
         choices=["stooq", "alpaca"],
         default="stooq",
         help="Price data source",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default="data",
+        help="Directory for cached price data (set empty to disable)",
+    )
+    parser.add_argument(
+        "--data-format",
+        choices=["csv", "parquet"],
+        default="csv",
+        help="Cache format for price data",
+    )
+    parser.add_argument(
+        "--refresh-data",
+        action="store_true",
+        help="Refresh cached price data",
     )
     parser.add_argument(
         "--tickers",
@@ -159,22 +177,153 @@ def _parse_fixed_weights(value: str) -> Dict[str, float]:
     return {k: v / total for k, v in weights.items()}
 
 
+def _ensure_parquet_support() -> None:
+    try:
+        import pyarrow  # noqa: F401
+    except ImportError:
+        try:
+            import fastparquet  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "Parquet support requires pyarrow or fastparquet. "
+                "Install with `pip install pyarrow` or `uv sync --extra data`."
+            ) from exc
+
+
+def _cache_path(
+    data_dir: Optional[Path],
+    source: str,
+    ticker: str,
+    data_format: str,
+) -> Optional[Path]:
+    if data_dir is None:
+        return None
+    ext = "csv" if data_format == "csv" else "parquet"
+    safe_ticker = ticker.replace("/", "_")
+    return data_dir / f"{source}_{safe_ticker}.{ext}"
+
+
+def _cache_covers_range(
+    frame: pd.DataFrame,
+    start: Optional[pd.Timestamp],
+    end: Optional[pd.Timestamp],
+) -> bool:
+    if frame.empty:
+        return False
+    idx = frame.index
+    if start is not None and idx.min() > start:
+        return False
+    if end is not None and idx.max() < end:
+        return False
+    return True
+
+
+def _load_cached_frame(path: Path, ticker: str, data_format: str) -> pd.DataFrame:
+    if data_format == "csv":
+        df = pd.read_csv(path, index_col=0, parse_dates=[0])
+    else:
+        _ensure_parquet_support()
+        df = pd.read_parquet(path)
+    if df.empty:
+        return df
+    if ticker not in df.columns and df.shape[1] == 1:
+        df.columns = [ticker]
+    if ticker not in df.columns:
+        raise ValueError(f"Cache file {path} missing column {ticker}.")
+    df = df[[ticker]].copy()
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    df.index.name = "Date"
+    return df
+
+
+def _save_cached_frame(path: Path, frame: pd.DataFrame, data_format: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame = frame.copy()
+    frame.index = pd.to_datetime(frame.index)
+    frame.index.name = "Date"
+    if data_format == "csv":
+        frame.to_csv(path)
+    else:
+        _ensure_parquet_support()
+        frame.to_parquet(path)
+
+
+def _merge_cached_frame(
+    cached: Optional[pd.DataFrame],
+    fresh: pd.DataFrame,
+) -> pd.DataFrame:
+    if cached is None or cached.empty:
+        combined = fresh.copy()
+    else:
+        combined = pd.concat([cached, fresh])
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+    return combined
+
+
+def _read_stooq_csv(url: str, max_retries: int = 3, timeout: int = 30) -> pd.DataFrame:
+    last_err: Optional[BaseException] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            resp.raise_for_status()
+            text = resp.text
+            if not text.strip():
+                raise ValueError("Empty response from Stooq.")
+            return pd.read_csv(io.StringIO(text))
+        except (
+            requests.exceptions.SSLError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.HTTPError,
+            pd.errors.EmptyDataError,
+            ValueError,
+        ) as exc:
+            last_err = exc
+            if attempt < max_retries:
+                time.sleep(2 ** (attempt - 1))
+            else:
+                break
+
+    try:
+        return pd.read_csv(url)
+    except Exception as exc:
+        if last_err is not None:
+            raise RuntimeError(
+                f"Failed to fetch Stooq data after {max_retries} attempts: {last_err}"
+            ) from exc
+        raise
+
+
 def fetch_stooq_prices(
     tickers: Iterable[str],
     start: Optional[pd.Timestamp],
     end: Optional[pd.Timestamp],
+    data_dir: Optional[Path],
+    data_format: str,
+    refresh_data: bool,
 ) -> pd.DataFrame:
     frames = []
     for ticker in tickers:
-        symbol = f"{ticker.lower()}.us"
-        url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
-        df = pd.read_csv(url)
-        if df.empty:
-            raise ValueError(f"No Stooq data for {ticker}.")
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-        df = df[["Close"]].rename(columns={"Close": ticker})
-        frames.append(df)
+        cache_path = _cache_path(data_dir, "stooq", ticker, data_format)
+        cached = None
+        if cache_path and cache_path.exists() and not refresh_data:
+            cached = _load_cached_frame(cache_path, ticker, data_format)
+
+        if cached is None or not _cache_covers_range(cached, start, end):
+            symbol = f"{ticker.lower()}.us"
+            url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+            df = _read_stooq_csv(url)
+            if df.empty:
+                raise ValueError(f"No Stooq data for {ticker}.")
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+            df = df[["Close"]].rename(columns={"Close": ticker})
+            if cache_path:
+                _save_cached_frame(cache_path, df, data_format)
+            frames.append(df)
+        else:
+            frames.append(cached)
 
     prices = pd.concat(frames, axis=1).sort_index()
     if start is not None:
@@ -188,8 +337,7 @@ def _to_rfc3339(ts: pd.Timestamp) -> str:
     ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
     return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-
-def fetch_alpaca_prices(
+def _fetch_alpaca_prices_remote(
     tickers: Iterable[str],
     start: Optional[pd.Timestamp],
     end: Optional[pd.Timestamp],
@@ -249,6 +397,58 @@ def fetch_alpaca_prices(
         frames.append(df)
 
     prices = pd.concat(frames, axis=1).sort_index()
+    return prices.dropna()
+
+
+def fetch_alpaca_prices(
+    tickers: Iterable[str],
+    start: Optional[pd.Timestamp],
+    end: Optional[pd.Timestamp],
+    feed: Optional[str],
+    data_dir: Optional[Path],
+    data_format: str,
+    refresh_data: bool,
+) -> pd.DataFrame:
+    tickers = list(tickers)
+    if data_dir is None:
+        return _fetch_alpaca_prices_remote(tickers, start, end, feed)
+
+    cached_frames: Dict[str, Optional[pd.DataFrame]] = {}
+    missing: List[str] = []
+
+    for ticker in tickers:
+        cache_path = _cache_path(data_dir, "alpaca", ticker, data_format)
+        cached = None
+        if cache_path and cache_path.exists() and not refresh_data:
+            cached = _load_cached_frame(cache_path, ticker, data_format)
+        if cached is None or not _cache_covers_range(cached, start, end):
+            missing.append(ticker)
+        cached_frames[ticker] = cached
+
+    if missing:
+        fresh_prices = _fetch_alpaca_prices_remote(missing, start, end, feed)
+        for ticker in missing:
+            if ticker not in fresh_prices.columns:
+                raise ValueError(f"No Alpaca data for {ticker}.")
+            fresh = fresh_prices[[ticker]].dropna()
+            combined = _merge_cached_frame(cached_frames[ticker], fresh)
+            cache_path = _cache_path(data_dir, "alpaca", ticker, data_format)
+            if cache_path:
+                _save_cached_frame(cache_path, combined, data_format)
+            cached_frames[ticker] = combined
+
+    frames = []
+    for ticker in tickers:
+        frame = cached_frames[ticker]
+        if frame is None or frame.empty:
+            raise ValueError(f"No Alpaca data for {ticker}.")
+        frames.append(frame)
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    if start is not None:
+        prices = prices.loc[start:]
+    if end is not None:
+        prices = prices.loc[:end]
     return prices.dropna()
 
 
@@ -436,6 +636,7 @@ def main() -> None:
     tickers = _parse_tickers(args.tickers)
     start = _parse_date(args.start)
     end = _parse_date(args.end)
+    data_dir = Path(args.data_dir).expanduser() if args.data_dir else None
 
     fixed_weights = None
     if args.portfolio == "fixed":
@@ -451,9 +652,24 @@ def main() -> None:
         fixed_weights = pd.Series({t: weights_map[t] for t in tickers})
 
     if args.data_source == "stooq":
-        prices = fetch_stooq_prices(tickers, start, end)
+        prices = fetch_stooq_prices(
+            tickers,
+            start,
+            end,
+            data_dir=data_dir,
+            data_format=args.data_format,
+            refresh_data=args.refresh_data,
+        )
     else:
-        prices = fetch_alpaca_prices(tickers, start, end, args.alpaca_feed)
+        prices = fetch_alpaca_prices(
+            tickers,
+            start,
+            end,
+            args.alpaca_feed,
+            data_dir=data_dir,
+            data_format=args.data_format,
+            refresh_data=args.refresh_data,
+        )
 
     gross_returns, weights_daily = compute_portfolio(
         prices=prices,
@@ -489,6 +705,10 @@ def main() -> None:
     print(f"Period          : {net_returns.index[0].date()} -> {net_returns.index[-1].date()}")
     print(f"Rebalance       : {args.rebalance}")
     print(f"Portfolio       : {args.portfolio}")
+    print(f"Data cache      : {data_dir if data_dir else 'disabled'}")
+    if data_dir:
+        print(f"Data format     : {args.data_format}")
+        print(f"Data refresh    : {'on' if args.refresh_data else 'off'}")
     print(f"Target vol      : {args.target_vol:.2%}")
     print(f"Max leverage    : {args.max_leverage:.2f}x")
     print(f"Trade cost      : {args.trade_cost * 1e4:.1f} bps")
@@ -542,6 +762,9 @@ def main() -> None:
             "lookback": args.lookback,
             "target_vol": args.target_vol,
             "max_leverage": args.max_leverage,
+            "data_dir": str(data_dir) if data_dir else None,
+            "data_format": args.data_format,
+            "refresh_data": args.refresh_data,
             "trade_cost": args.trade_cost,
             "borrow_rate": args.borrow_rate,
             "cash_rate": args.cash_rate,
