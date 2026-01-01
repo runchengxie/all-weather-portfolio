@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "all-weather-portfolio"
+version = "0.1.0"
+description = "All Weather portfolio backtest (risk parity + vol targeting)."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.22",
+  "pandas>=1.5",
+  "requests>=2.28",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+]
+
+[project.scripts]
+all-weather-backtest = "all_weather_backtest:main"
+
+[tool.setuptools]
+py-modules = ["all_weather_backtest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
